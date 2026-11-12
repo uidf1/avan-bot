@@ -204,10 +204,32 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
   token = data["token"]
   max_price = data["max_price"]
   item_name = data["item_name"]
-  # достаем цену в рублях
-  price_rub = data.get("price_rub", 0.0) 
+  price_rub = data.get("price_rub", 0.0)
 
-  # ... (оставляешь код отправки запроса к апи без изменений)
+  await callback.message.edit_text(
+      f"Отправляю трейд для `{item_name}`...", parse_mode="Markdown"
+  )
+
+  headers = {
+      "Authorization": f"Bearer {AVAN_API_KEY}",
+      "Content-Type": "application/json",
+  }
+  payload = {
+      "id": skin_id,
+      "partner": partner,
+      "token": token,
+      "max_price": max_price,
+  }
+
+  async with httpx.AsyncClient() as client:
+    try:
+      buy_res = await client.post(
+          f"{AVAN_BASE_URL}/market/buy",
+          json=payload,
+          headers=headers,
+          timeout=35.0,
+      )
+      res_json = buy_res.json()
 
       if buy_res.status_code == 200:
         p_id = res_json.get("data", {}).get("purchase_id", "N/A")
@@ -217,7 +239,6 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
             text="🔄 Проверить статус", callback_data=f"check_{p_id}"
         )
 
-        # выводим полные данные о покупке
         await callback.message.edit_text(
             f"✅ **Успешно! Трейд отправлен.**\n\n"
             f"📦 Товар: `{item_name}`\n"
@@ -226,6 +247,17 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
             parse_mode="Markdown",
             reply_markup=builder.as_markup(),
         )
+      else:
+        err_msg = res_json.get("message", "Неизвестная ошибка")
+        code = res_json.get("code", "")
+        await callback.message.edit_text(
+            f"Ошибка Avan ({buy_res.status_code}): {err_msg} [{code}]"
+        )
+
+    except Exception as e:
+      await callback.message.edit_text(
+          f"Сбой выполнения: `{str(e)}`", parse_mode="Markdown"
+      )
           
 @dp.callback_query(BuyStates.confirming, F.data == "cancel_buy")
 async def process_cancel(callback: types.CallbackQuery, state: FSMContext):
