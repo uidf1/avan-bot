@@ -52,14 +52,21 @@ def parse_trade_link(url: str):
 
 
 async def get_usd_to_rub() -> float:
+  # внутренний курс авана выше биржевого на ~4.3%
+  avan_markup = 1.043
+
   try:
     async with httpx.AsyncClient() as client:
       res = await client.get("https://open.er-api.com/v6/latest/USD", timeout=5.0)
       if res.status_code == 200:
-        return float(res.json()["rates"].get("RUB", 95.0))
+        forex_rate = float(res.json()["rates"].get("RUB", 83.08))
+        return forex_rate * avan_markup
   except Exception:
     pass
-  return 95.0
+
+  # запасной курс, если api валют временно недоступен
+  return 86.65
+
 
 
 async def get_item_id(item_name: str) -> tuple[str | None, float | None]:
