@@ -147,23 +147,35 @@ async def cmd_buy(message: types.Message, state: FSMContext):
     await message.answer("Ошибка: не удалось распарсить трейд-ссылку!")
     return
 
+  # сохраняем ссылку заранее, чтобы потом передать ее в мониторинг
+  await state.update_data(trade_link=trade_link)
+
   msg = await message.answer(
       f"Ищу `{item_name}` на Avan Market...", parse_mode="Markdown"
   )
 
+  # тут должна быть обновленная get_item_id, которая ищет самую дешевую шмотку
   skin_id, price_usd = await get_item_id(item_name)
   if not skin_id:
-    await msg.edit_text(f"Предмет `{item_name}` не найден на маркете!")
+    # если не нашли — предлагаем начать мониторинг
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👀 Отслеживать появление", callback_data=f"track_{weather_code}")
+    await msg.edit_text(
+        f"Предмет `{item_name}` не найден на маркете!",
+        reply_markup=builder.as_markup()
+    )
     return
 
   rate = await get_usd_to_rub()
   price_rub = price_usd * rate
 
+  # сохраняем цену в рублях и убираем + 0.5 из max_price
   await state.update_data(
       skin_id=skin_id,
       partner=partner,
       token=token,
-      max_price=price_usd + 0.5,
+      max_price=price_usd,
+      price_rub=price_rub,
       item_name=item_name,
   )
   await state.set_state(BuyStates.confirming)
@@ -192,31 +204,10 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
   token = data["token"]
   max_price = data["max_price"]
   item_name = data["item_name"]
+  # достаем цену в рублях
+  price_rub = data.get("price_rub", 0.0) 
 
-  await callback.message.edit_text(
-      f"Отправляю трейд для `{item_name}`...", parse_mode="Markdown"
-  )
-
-  headers = {
-      "Authorization": f"Bearer {AVAN_API_KEY}",
-      "Content-Type": "application/json",
-  }
-  payload = {
-      "id": skin_id,
-      "partner": partner,
-      "token": token,
-      "max_price": max_price,
-  }
-
-  async with httpx.AsyncClient() as client:
-    try:
-      buy_res = await client.post(
-          f"{AVAN_BASE_URL}/market/buy",
-          json=payload,
-          headers=headers,
-          timeout=35.0,
-      )
-      res_json = buy_res.json()
+  # ... (оставляешь код отправки запроса к апи без изменений)
 
       if buy_res.status_code == 200:
         p_id = res_json.get("data", {}).get("purchase_id", "N/A")
@@ -226,24 +217,16 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
             text="🔄 Проверить статус", callback_data=f"check_{p_id}"
         )
 
+        # выводим полные данные о покупке
         await callback.message.edit_text(
-            f"✅ Успешно! Трейд отправлен.\nID покупки: `{p_id}`",
+            f"✅ **Успешно! Трейд отправлен.**\n\n"
+            f"📦 Товар: `{item_name}`\n"
+            f"💵 Куплено за: **${max_price:.2f}** (~**{price_rub:.2f} ₽**)\n"
+            f"🆔 ID покупки: `{p_id}`",
             parse_mode="Markdown",
             reply_markup=builder.as_markup(),
         )
-      else:
-        err_msg = res_json.get("message", "Неизвестная ошибка")
-        code = res_json.get("code", "")
-        await callback.message.edit_text(
-            f"Ошибка Avan ({buy_res.status_code}): {err_msg} [{code}]"
-        )
-
-    except Exception as e:
-      await callback.message.edit_text(
-          f"Сбой выполнения: `{str(e)}`", parse_mode="Markdown"
-      )
-
-
+          
 @dp.callback_query(BuyStates.confirming, F.data == "cancel_buy")
 async def process_cancel(callback: types.CallbackQuery, state: FSMContext):
   await state.clear()
@@ -307,6 +290,61 @@ async def process_check_status(callback: types.CallbackQuery):
     except Exception as e:
       await callback.answer(f"Ошибка запроса: {str(e)}", show_alert=True)
 
+# словарь для хранения активных задач мониторинга
+monitoring_tasks = {}
+
+@dp.callback_query(F.data.startswith("track_"))
+async def process_track(callback: types.CallbackQuery, state: FSMContext):
+  weather_code = callback.data.split("_", 1)[1]
+  item_name = WEATHER_MAP.get(weather_code, weather_code)
+
+  # защита от случайного запуска нескольких одинаковых задач
+  if weather_code in monitoring_tasks:
+    await callback.answer("уже отслеживаю этот предмет!", show_alert=True)
+    return
+
+  data = await state.get_data()
+  trade_link = data.get("trade_link")
+
+  if not trade_link:
+    await callback.answer("ошибка: не найдена трейд-ссылка.", show_alert=True)
+    return
+
+  await callback.message.edit_text(
+      f"👀 Начал отслеживать `{item_name}`.\n"
+      f"Буду проверять каждые 30 секунд. Как только появится — пришлю уведомление!",
+      parse_mode="Markdown"
+  )
+
+  # запускаем асинхронный цикл проверки в фоне
+  task = asyncio.create_task(monitor_item(callback.from_user.id, weather_code, item_name, trade_link))
+  monitoring_tasks[weather_code] = task
+
+async def monitor_item(user_id: int, weather_code: str, item_name: str, trade_link: str):
+  while True:
+    await asyncio.sleep(30)
+    try:
+      skin_id, price_usd = await get_item_id(item_name)
+      if skin_id:
+        rate = await get_usd_to_rub()
+        price_rub = price_usd * rate
+
+        msg = (
+            f"🚨 **ПРЕДМЕТ ПОЯВИЛСЯ НА МАРКЕТЕ!** 🚨\n\n"
+            f"📦 Товар: `{item_name}`\n"
+            f"💵 Цена: **${price_usd:.2f}** (~**{price_rub:.2f} ₽**)\n\n"
+            f"Для покупки нажми или скопируй команду:\n"
+            f"`/buy {weather_code} {trade_link}`"
+        )
+        await bot.send_message(user_id, msg, parse_mode="Markdown")
+
+        # удаляем задачу после успеха и завершаем цикл
+        if weather_code in monitoring_tasks:
+          del monitoring_tasks[weather_code]
+        break
+    except Exception as e:
+        # игнорируем сетевые ошибки, чтобы цикл не упал
+        pass
 
 async def main():
   await dp.start_polling(bot)
