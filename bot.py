@@ -65,16 +65,33 @@ async def get_usd_to_rub() -> float:
 async def get_item_id(item_name: str) -> tuple[str | None, float | None]:
   headers = {"Authorization": f"Bearer {AVAN_API_KEY}"}
   params = {"game": 570, "names[]": item_name}
+  all_items = []
 
   async with httpx.AsyncClient() as client:
-    res = await client.get(
-        f"{AVAN_BASE_URL}/market/search", params=params, headers=headers
-    )
-    if res.status_code == 200:
-      data = res.json().get("data", [])
-      if data:
-        return data[0]["id"], data[0]["price"]
-  return None, None
+    while True:
+      res = await client.get(
+          f"{AVAN_BASE_URL}/market/search", params=params, headers=headers
+      )
+      if res.status_code != 200:
+        break
+
+      body = res.json()
+      data = body.get("data", [])
+      all_items.extend(data)
+
+      # если лотов больше 200, догружаем следующую страницу через курсор
+      next_page = body.get("meta", {}).get("next_page")
+      if not next_page:
+        break
+      params["next_page"] = next_page
+
+  if not all_items:
+    return None, None
+
+  # берем самый дешевый лот из всего списка вместо первого попавшегося data[0]
+  cheapest = min(all_items, key=lambda item: float(item["price"]))
+  return cheapest["id"], float(cheapest["price"])
+
 
 
 @dp.message(Command("start"))
