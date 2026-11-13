@@ -26,6 +26,7 @@ dp = Dispatcher()
 
 class BuyStates(StatesGroup):
   confirming = State()
+  waiting_for_price = State()
 
 
 WEATHER_MAP = {
@@ -218,8 +219,9 @@ async def cmd_buy(message: types.Message, state: FSMContext):
 
   builder = InlineKeyboardBuilder()
   builder.button(text="✅ Купить", callback_data="confirm_buy")
+  builder.button(text="📉 Автопокупка по своей цене", callback_data="wait_price")
   builder.button(text="❌ Отмена", callback_data="cancel_buy")
-  builder.adjust(2)
+  builder.adjust(1,2)
 
   await msg.edit_text(
       f"📦 Товар: *{item_name}*\n"
@@ -414,6 +416,107 @@ async def monitor_item(user_id: int, weather_code: str, item_name: str, trade_li
         # игнорируем сетевые ошибки, чтобы цикл не упал
         pass
 
+
+
+autobuy_tasks = {}
+
+@dp.callback_query(BuyStates.confirming, F.data == "wait_price")
+async def process_wait_price(callback: types.CallbackQuery, state: FSMContext):
+  await callback.message.edit_text(
+      "Отправь мне желаемую цену в **рублях** (например, `70` или `75.5`).\n"
+      "Я буду проверять маркет каждые 30 секунд и автоматически выкуплю предмет, "
+      "как только он будет стоить столько или дешевле.",
+      parse_mode="Markdown"
+  )
+  await state.set_state(BuyStates.waiting_for_price)
+
+@dp.message(BuyStates.waiting_for_price)
+async def process_target_price_input(message: types.Message, state: FSMContext):
+  # Пытаемся превратить текст сообщения в число (меняем запятую на точку на всякий случай)
+  try:
+    target_price = float(message.text.replace(",", "."))
+  except ValueError:
+    await message.answer("❌ Ошибка! Напиши просто число (например, 70). Попробуй еще раз:")
+    return
+
+  data = await state.get_data()
+  item_name = data["item_name"]
+  partner = data["partner"]
+  token = data["token"]
+  
+  await state.clear()
+
+  await message.answer(
+      f"✅ **Снайпер запущен!**\n"
+      f"📦 Товар: `{item_name}`\n"
+      f"🎯 Ждем цену: **{target_price} ₽** или ниже.\n"
+      f"Я пришлю уведомление, когда успешно выкуплю его.",
+      parse_mode="Markdown"
+  )
+
+  # Запускаем фоновую задачу автопокупки
+  task = asyncio.create_task(
+      auto_buy_loop(message.from_user.id, item_name, partner, token, target_price)
+  )
+  autobuy_tasks[item_name] = task
+
+async def auto_buy_loop(user_id: int, item_name: str, partner: str, token: str, target_price_rub: float):
+  while True:
+    await asyncio.sleep(30)
+    try:
+      skin_id, price_usd = await get_item_id(item_name)
+      if skin_id:
+        rate = await get_usd_to_rub()
+        current_price_rub = price_usd * rate
+
+        # Если текущая цена меньше или равна желаемой — ПОКУПАЕМ!
+        if current_price_rub <= target_price_rub:
+          headers = {
+              "Authorization": f"Bearer {AVAN_API_KEY}",
+              "Content-Type": "application/json",
+          }
+          payload = {
+              "id": skin_id,
+              "partner": partner,
+              "token": token,
+              "max_price": price_usd, # берем актуальную цену в USD
+          }
+          
+          async with httpx.AsyncClient() as client:
+            buy_res = await client.post(
+                f"{AVAN_BASE_URL}/market/buy",
+                json=payload,
+                headers=headers,
+                timeout=35.0,
+            )
+            res_json = buy_res.json()
+
+            if buy_res.status_code == 200:
+              p_id = res_json.get("data", {}).get("purchase_id", "N/A")
+              builder = InlineKeyboardBuilder()
+              builder.button(text="🔄 Проверить статус", callback_data=f"check_{p_id}")
+              
+              msg = (
+                  f"🎉 **СРАБОТАЛА АВТОПОКУПКА!** 🎉\n\n"
+                  f"📦 Товар: `{item_name}`\n"
+                  f"💵 Куплено за: **${price_usd:.2f}** (~**{current_price_rub:.2f} ₽**)\n"
+                  f"🎯 Твоя цель была: `{target_price_rub} ₽`\n"
+                  f"🆔 ID покупки: `{p_id}`"
+              )
+              await bot.send_message(user_id, msg, parse_mode="Markdown", reply_markup=builder.as_markup())
+            else:
+              err_msg = res_json.get("message", "Неизвестная ошибка")
+              await bot.send_message(user_id, f"❌ Ошибка автопокупки `{item_name}`: {err_msg}")
+          
+          # Завершаем цикл после попытки купить (неважно, успешной или нет)
+          if item_name in autobuy_tasks:
+            del autobuy_tasks[item_name]
+          break
+          
+    except Exception:
+      # Игнорируем ошибки сети при проверке, чтобы бот продолжал мониторить дальше
+      pass
+        
 async def main():
   await dp.start_polling(bot)
 
