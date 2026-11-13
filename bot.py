@@ -68,37 +68,73 @@ async def get_usd_to_rub() -> float:
   return 86.65
 
 
-
 async def get_item_id(item_name: str) -> tuple[str | None, float | None]:
   headers = {"Authorization": f"Bearer {AVAN_API_KEY}"}
-  params = {"game": 570, "names[]": item_name}
-  all_items = []
-
+  
+  # Просим API маркета сразу отсортировать выдачу по цене
+  params = {
+      "game": 570, 
+      "names[]": item_name,
+      "sort": "price",   
+      "order": "asc"     
+  }
+  
   async with httpx.AsyncClient() as client:
-    while True:
+    try:
       res = await client.get(
-          f"{AVAN_BASE_URL}/market/search", params=params, headers=headers
+          f"{AVAN_BASE_URL}/market/search", params=params, headers=headers, timeout=10.0
       )
-      if res.status_code != 200:
-        break
+      
+      if res.status_code == 200:
+        data = res.json().get("data", [])
+        if not data:
+          return None, None
+          
+        # Выводим первый (самый дешевый) лот в консоль сервера.
+        # Если бот опять ошибется ценой, скопируй то, что выведет этот print!
+        print("\n--- DEBUG: СТРУКТУРА ПРЕДМЕТА ИЗ API ---")
+        print(data[0])
+        print("----------------------------------------\n")
 
-      body = res.json()
-      data = body.get("data", [])
-      all_items.extend(data)
+        cheapest_item = None
+        min_real_price = 99999.0
 
-      # если лотов больше 200, догружаем следующую страницу через курсор
-      next_page = body.get("meta", {}).get("next_page")
-      if not next_page:
-        break
-      params["next_page"] = next_page
+        for item in data:
+          # Берем базовую цену (которая 1.26$)
+          base_price = float(item.get("price", 9999))
+          real_price = base_price
+          
+          # 1. Проверяем, отдало ли API отдельное поле с уже примененной скидкой
+          for key in ["discount_price", "actual_price", "final_price", "sell_price"]:
+              if key in item and item[key] is not None:
+                  try:
+                      real_price = float(item[key])
+                      break
+                  except (ValueError, TypeError):
+                      pass
+                      
+          # 2. Если есть только процент скидки (например, 41), считаем финальную цену математикой
+          if "discount" in item and item["discount"]:
+              try:
+                  discount_pct = float(item["discount"])
+                  calc_price = base_price * (1 - (discount_pct / 100.0))
+                  if calc_price < real_price:
+                      real_price = calc_price
+              except (ValueError, TypeError):
+                  pass
 
-  if not all_items:
-    return None, None
+          # Ищем минимальную РЕАЛЬНУЮ цену среди всех предложений
+          if real_price < min_real_price:
+            min_real_price = real_price
+            cheapest_item = item
 
-  # берем самый дешевый лот из всего списка вместо первого попавшегося data[0]
-  cheapest = min(all_items, key=lambda item: float(item["price"]))
-  return cheapest["id"], float(cheapest["price"])
+        if cheapest_item:
+          return cheapest_item["id"], min_real_price
 
+    except Exception as e:
+      print(f"Ошибка при поиске предмета: {e}")
+      
+  return None, None
 
 
 @dp.message(Command("start"))
