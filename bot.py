@@ -432,7 +432,6 @@ async def process_wait_price(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(BuyStates.waiting_for_price)
 async def process_target_price_input(message: types.Message, state: FSMContext):
-  # Пытаемся превратить текст сообщения в число (меняем запятую на точку на всякий случай)
   try:
     target_price = float(message.text.replace(",", "."))
   except ValueError:
@@ -446,9 +445,13 @@ async def process_target_price_input(message: types.Message, state: FSMContext):
   
   await state.clear()
 
+  # Создаем уникальный ключ для задачи, чтобы можно было снайпить один предмет для разных людей
+  task_key = f"{item_name}_{partner}"
+
   await message.answer(
       f"✅ **Снайпер запущен!**\n"
       f"📦 Товар: `{item_name}`\n"
+      f"👤 Клиент (partner): `{partner}`\n"
       f"🎯 Ждем цену: **{target_price} ₽** или ниже.\n"
       f"Я пришлю уведомление, когда успешно выкуплю его.",
       parse_mode="Markdown"
@@ -458,9 +461,12 @@ async def process_target_price_input(message: types.Message, state: FSMContext):
   task = asyncio.create_task(
       auto_buy_loop(message.from_user.id, item_name, partner, token, target_price)
   )
-  autobuy_tasks[item_name] = task
+  autobuy_tasks[task_key] = task
+
 
 async def auto_buy_loop(user_id: int, item_name: str, partner: str, token: str, target_price_rub: float):
+  task_key = f"{item_name}_{partner}"
+  
   while True:
     await asyncio.sleep(30)
     try:
@@ -469,7 +475,6 @@ async def auto_buy_loop(user_id: int, item_name: str, partner: str, token: str, 
         rate = await get_usd_to_rub()
         current_price_rub = price_usd * rate
 
-        # Если текущая цена меньше или равна желаемой — ПОКУПАЕМ!
         if current_price_rub <= target_price_rub:
           headers = {
               "Authorization": f"Bearer {AVAN_API_KEY}",
@@ -479,7 +484,7 @@ async def auto_buy_loop(user_id: int, item_name: str, partner: str, token: str, 
               "id": skin_id,
               "partner": partner,
               "token": token,
-              "max_price": price_usd, # берем актуальную цену в USD
+              "max_price": price_usd,
           }
           
           async with httpx.AsyncClient() as client:
@@ -496,25 +501,27 @@ async def auto_buy_loop(user_id: int, item_name: str, partner: str, token: str, 
               builder = InlineKeyboardBuilder()
               builder.button(text="🔄 Проверить статус", callback_data=f"check_{p_id}")
               
+              # Собираем трейд-ссылку обратно
+              trade_url = f"https://steamcommunity.com/tradeoffer/new/?partner={partner}&token={token}"
+              
               msg = (
                   f"🎉 **СРАБОТАЛА АВТОПОКУПКА!** 🎉\n\n"
                   f"📦 Товар: `{item_name}`\n"
+                  f"🔗 Трейд-ссылка: {trade_url}\n"
                   f"💵 Куплено за: **${price_usd:.2f}** (~**{current_price_rub:.2f} ₽**)\n"
                   f"🎯 Твоя цель была: `{target_price_rub} ₽`\n"
                   f"🆔 ID покупки: `{p_id}`"
               )
-              await bot.send_message(user_id, msg, parse_mode="Markdown", reply_markup=builder.as_markup())
+              await bot.send_message(user_id, msg, parse_mode="Markdown", disable_web_page_preview=True, reply_markup=builder.as_markup())
             else:
               err_msg = res_json.get("message", "Неизвестная ошибка")
-              await bot.send_message(user_id, f"❌ Ошибка автопокупки `{item_name}`: {err_msg}")
+              await bot.send_message(user_id, f"❌ Ошибка автопокупки `{item_name}` для `{partner}`: {err_msg}")
           
-          # Завершаем цикл после попытки купить (неважно, успешной или нет)
-          if item_name in autobuy_tasks:
-            del autobuy_tasks[item_name]
+          if task_key in autobuy_tasks:
+            del autobuy_tasks[task_key]
           break
           
     except Exception:
-      # Игнорируем ошибки сети при проверке, чтобы бот продолжал мониторить дальше
       pass
         
 async def main():
